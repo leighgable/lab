@@ -1,0 +1,28 @@
+[project]
+name = "experiment"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "torch",
+    "torchvision",
+    "penzai",
+    "jax",
+    "optax",
+    "treescope",
+    "ipykernel>=7.2.0",
+    "jupyter>=1.1.1",
+    "ipython>=9.12.0",
+    "safetensors>=0.7.0",
+    "pydantic>=2.12.5",
+    "sentencepiece>=0.2.1",
+    "einops>=0.8.2",
+]
+
+[project.scripts]
+experiment = "experiment:exp"
+
+[build-system]
+requires = ["uv_build>=0.11.0,<0.12.0"]
+build-backend = "uv_build"
+
