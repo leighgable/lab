@@ -8,7 +8,6 @@ from pydantic import (
   )
 import json
 
-
 def load_gemma_config(path: str) -> Gemma3nConfig:
     """
     Loads a Gemma 3N configuration from a JSON file.
@@ -42,6 +41,73 @@ def load_gemma_config(path: str) -> Gemma3nConfig:
         print(f"Configuration validation failed: {e}")
         raise
 
+def load_preprocessor_config(path: str) -> PreprocessorConfig:
+    """
+    Loads a Gemma 3N configuration from a JSON file.
+    Supports both HF-style nested configs and custom flat configs.
+    """
+    with open(path, 'r') as f:
+        config_dict = json.load(f)
+    try:
+        return PreprocessorConfig.model_validate(config_dict)
+    except ValidationError as e:
+        print(f"Configuration validation failed: {e}")
+        raise
+
+
+def load_processor_config(path: str) -> ProcessorConfig:
+    """
+    Loads a Gemma 3N configuration from a JSON file.
+    Supports both HF-style nested configs and custom flat configs.
+    """
+    with open(path, 'r') as f:
+        config_dict = json.load(f)
+    try:
+        return PreprocessorConfig.model_validate(config_dict)
+    except ValidationError as e:
+        print(f"Configuration validation failed: {e}")
+        raise
+
+class ProcessorConfig(BaseModel):
+  model_config = ConfigDict(extra='ignore',
+                            arbitrary_types_allowed=True,)
+  audio_seq_length: int
+  image_seq_length: int
+  processor_class: str
+    
+class PreprocessorConfig(BaseModel):
+  model_config = ConfigDict(extra='ignore',
+                            arbitrary_types_allowed=True,)
+  data_format: str
+  default_to_square: bool
+  dither: float
+  do_rescale: bool
+  do_resize: bool
+  feature_extractor_type: str
+  feature_size: int
+  fft_length: int
+  fft_overdrive: bool
+  frame_length: int
+  hop_length: int
+  image_mean: list[float]
+  image_processor_type: str
+  image_seq_length: int
+  image_std: list[float]
+  input_scale_factor: float
+  max_frequency: float
+  mel_floor: float
+  min_frequency: float
+  padding_side: str
+  padding_value: float
+  preemphasis: float
+  preemphasis_htk_flavor: bool
+  processor_class: str
+  resample: int
+  rescale_factor: float
+  return_attention_mask: bool
+  sampling_rate: int
+  size: dict
+  
 class VisionConfig(BaseModel):
   model_config = ConfigDict(extra='ignore',
                             arbitrary_types_allowed=True,)
@@ -53,6 +119,8 @@ class VisionConfig(BaseModel):
   rms_norm_eps: float = Field(default=1e-06) # 1e-06
   vocab_offset: int = Field(default=262144) # 262144
   vocab_size: int = Field(default=128) # 128
+  torch_dtype: str = Field(default="torch.bfloat16")    # bfloat16
+  param_dtype: str = Field(default="torch.float32")    # float32
 
 class AudioConfig(BaseModel):
   model_config = ConfigDict(extra='ignore',
@@ -122,6 +190,8 @@ class TextConfig(BaseModel):
   rope_theta: float = Field(default=1_000_000.0)        # 1_000_000.0,
   sliding_window: int = Field(default=512)              # 512,
   use_cache: bool = Field(default=True)                 # true,
+  torch_dtype: str = Field(default="torch.bfloat16")    # bfloat16
+  param_dtype: str = Field(default="torch.float32")    # float32
   vocab_size: int = Field(default=262400)               # 262400,
   vocab_size_per_layer_input: int = Field(default=262144)  # 262144
     
@@ -144,3 +214,56 @@ class Gemma3nConfig(BaseModel):
   text: TextConfig
   vision: VisionConfig | None
   audio: AudioConfig | None
+
+# """{
+#   "crop_size": null,
+#   "data_format": "channels_first",
+#   "default_to_square": false,
+#   "device": null,
+#   "disable_grouping": null,
+#   "dither": 0.0,
+#   "do_center_crop": null,
+#   "do_convert_rgb": null,
+#   "do_normalize": false,
+#   "do_rescale": true,
+#   "do_resize": true,
+#   "feature_extractor_type": "Gemma3nAudioFeatureExtractor",
+#   "feature_size": 128,
+#   "fft_length": 1024,
+#   "fft_overdrive": true,
+#   "frame_length": 512,
+#   "hop_length": 160,
+#   "image_mean": [
+#     0.5,
+#     0.5,
+#     0.5
+#   ],
+#   "image_processor_type": "SiglipImageProcessorFast",
+#   "image_seq_length": 256,
+#   "image_std": [
+#     0.5,
+#     0.5,
+#     0.5
+#   ],
+#   "input_data_format": null,
+#   "input_scale_factor": 1.0,
+#   "max_frequency": 7600.0,
+#   "mel_floor": 1e-05,
+#   "min_frequency": 125.0,
+#   "padding_side": "right",
+#   "padding_value": 0.0,
+#   "per_bin_mean": null,
+#   "per_bin_stddev": null,
+#   "preemphasis": 0.97,
+#   "preemphasis_htk_flavor": true,
+#   "processor_class": "Gemma3nProcessor",
+#   "resample": 2,
+#   "rescale_factor": 0.00392156862745098,
+#   "return_attention_mask": true,
+#   "return_tensors": null,
+#   "sampling_rate": 16000,
+#   "size": {
+#     "height": 768,
+#     "width": 768
+#   }
+# }"""

@@ -16,17 +16,19 @@ LayerCache = dict[str, torch.Tensor]
 def create_sliding_mask(
     q_pos: torch.Tensor,
     k_pos: torch.Tensor,
+    q_modality: torch.Tensor | None = None,
+    k_modality: torch.Tensor | None = None,
     window_size: int | None = None,
     prefix_length: int = 0,
     is_causal: bool = True
 ):
     """
     Creates an attention mask supporting:
-    - Causal masking (if is_causal=True)
-    - Sliding window (if window_size > 0)
-    - Bidirectional prefix (if prefix_length > 0)
+    - Causal masking
+    - Sliding window
+    - Bidirectional prefix
+    - Multimodal "Islands" (Bidirectional for images/audio)
     """
-    # q_pos: [batch, q_seq], k_pos: [batch, k_seq]
     # dist: [batch, q_seq, k_seq]
     dist = q_pos.unsqueeze(-1) - k_pos.unsqueeze(-2)
     
@@ -36,15 +38,24 @@ def create_sliding_mask(
     else:
         mask = torch.ones_like(dist, dtype=torch.bool)
         
-    # 2. Sliding Window Constraint
+    # 2. Multimodal Bidirectional Exception
+    # Allow non-text tokens (Image=1, Audio=2) to see each other bidirectionally
+    if is_causal and q_modality is not None and k_modality is not None:
+        qm = q_modality.unsqueeze(-1)
+        km = k_modality.unsqueeze(-2)
+        # Same non-text modality can see each other
+        # Note: We assume same-modality = same object/block for now.
+        is_mm_island = (qm == km) & (qm != 0)
+        mask = mask | is_mm_island
+
+    # 3. Sliding Window Constraint
     if window_size is not None and window_size > 0:
         is_in_window = (dist < window_size)
         # KV tokens in the prefix are exempt from sliding window (always visible)
         is_kv_prefix = (k_pos.unsqueeze(-2) < prefix_length)
         mask &= (is_in_window | is_kv_prefix)
         
-    # 3. Bidirectional Prefix Exception
-    # Allow query tokens in the prefix to see all other prefix tokens (bidirectional)
+    # 4. Bidirectional Prefix Exception
     if is_causal and prefix_length > 0:
         is_q_prefix = (q_pos.unsqueeze(-1) < prefix_length)
         is_kv_prefix = (k_pos.unsqueeze(-2) < prefix_length)
@@ -61,7 +72,7 @@ class MatryoshkaAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.attn_type = config.layer_types[block_idx]
         self.rope_base_frequency = config.rope_local_base_freq if self.attn_type == "sliding_attention" else config.rope_theta
-        self.attn_logits_softcap = config.final_logit_softcapping
+        self.attn_logits_softcap = 50.0 # config.final_logit_softcapping
         self.sliding_window_size = config.sliding_window
         self.is_producer: bool = (block_idx % config.num_kv_shared_layers == 0)
       
@@ -102,9 +113,11 @@ class MatryoshkaAttention(nn.Module):
                 rope_pos: torch.Tensor | None = None,
                 cos_cache: torch.Tensor | None = None,
                 sin_cache: torch.Tensor | None = None,
+                modality_mask: torch.Tensor | None = None,
                 **side_inputs,
     ) -> tuple[LayerCache | None, LayerCache | None, torch.Tensor]:
 
+        batch_size, seq_len = x.shape[:2] 
         n_heads = (self.num_heads * d_model) // self.embedding_dim
         group_size = self.num_heads // self.num_kv_heads
         n_heads = max(n_heads, group_size)
@@ -119,9 +132,14 @@ class MatryoshkaAttention(nn.Module):
             k, v = kv_shared_cache['k'], kv_shared_cache['v']
         else:
             qkv = self.qkv_einsum("btd, ndh -> btnh", x, n=total_heads, d=d_model)
-            qkv = self.qkv_norm(qkv, n=total_heads)
-            
+            # Normalization ONLY for Q and K (indices 0 to n_heads + n_kv_heads)
             q, k, v = torch.split(qkv, [n_heads, n_kv_heads, n_kv_heads], dim=2)
+            
+            # Use pattern-based norm for q and k
+            q = self.qkv_norm(q, n=n_heads)
+            # Offset for k in the fused norm weight table
+            k = self.qkv_norm(k, n=n_kv_heads, offset=n_heads)
+            # V remains un-normalized
         
         # Force consistent dtype
         q, k, v = q.to(x.dtype), k.to(x.dtype), v.to(x.dtype)
@@ -136,7 +154,6 @@ class MatryoshkaAttention(nn.Module):
                 k = apply_rotary_pos_emb(k, cos, sin)
 
         if kv_cache is not None:
-            batch_size, seq_len = x.shape[:2] 
             curr_idx = kv_cache['end_index'][0].item()
 
             if needs_kv:
@@ -144,6 +161,8 @@ class MatryoshkaAttention(nn.Module):
                 kv_cache['k'][:, curr_idx:curr_idx + seq_len, :n_kv_heads, :] = k
                 kv_cache['v'][:, curr_idx:curr_idx + seq_len, :n_kv_heads, :] = v
                 kv_cache['positions'][:, curr_idx:curr_idx + seq_len] = segment_pos
+                if modality_mask is not None:
+                    kv_cache['modalities'][:, curr_idx:curr_idx + seq_len] = modality_mask
                 kv_cache['end_index'] += seq_len
                 actual_end_idx = curr_idx + seq_len
             else:
@@ -153,8 +172,10 @@ class MatryoshkaAttention(nn.Module):
             k = kv_cache['k'][:, :actual_end_idx, :n_kv_heads, :]
             v = kv_cache['v'][:, :actual_end_idx, :n_kv_heads, :]
             k_pos = kv_cache['positions'][:, :actual_end_idx]
+            k_modality = kv_cache['modalities'][:, :actual_end_idx]
         else:
             k_pos = segment_pos
+            k_modality = modality_mask
 
         # Attention Dynamic Generation
         if attn_mask is None:
@@ -162,6 +183,8 @@ class MatryoshkaAttention(nn.Module):
             mask_bool = create_sliding_mask(
                 q_pos=segment_pos,
                 k_pos=k_pos,
+                q_modality=modality_mask,
+                k_modality=k_modality,
                 window_size=window,
                 prefix_length=prefix_length,
                 is_causal=True
@@ -170,52 +193,37 @@ class MatryoshkaAttention(nn.Module):
             # Unsqueeze for broadcasting across heads: [batch, 1, q_seq, k_seq]
             attn_mask = attn_mask.unsqueeze(1)
 
-        # GQA Attention using broadcasting to save memory
+        # GQA Attention using einsum for readability and efficiency
         heads_per_group = n_heads // n_kv_heads
         scale = self.head_dim**-0.5
-        q_seq_len = x.shape[1]
-        k_seq_len = k.shape[1]
         
         if heads_per_group > 1:
-            # q: [batch, q_seq, n_heads, head_dim] -> [batch, n_heads, q_seq, head_dim]
-            q_reshaped = q.transpose(1, 2)
-            # -> [batch, n_kv_heads, heads_per_group, q_seq, head_dim]
-            q_reshaped = q_reshaped.view(batch_size, n_kv_heads, heads_per_group, q_seq_len, self.head_dim)
-            
-            # k: [batch, k_seq, n_kv_heads, head_dim] -> [batch, n_kv_heads, k_seq, head_dim]
-            k_reshaped = k.to(x.dtype).transpose(1, 2)
-            # [batch, n_kv_heads, 1, k_seq, head_dim]
-            k_reshaped = k_reshaped.unsqueeze(2)
-            
-            # [batch, n_kv_heads, heads_per_group, q_seq, k_seq]
-            logits = torch.matmul(q_reshaped, k_reshaped.transpose(-1, -2)) * scale
-            # [batch, n_heads, q_seq, k_seq]
-            logits = logits.reshape(batch_size, n_heads, q_seq_len, k_seq_len)
+            # Reshape q to expose the GQA groups: [b, t, n_kv, g, h]
+            q_gqa = q.view(batch_size, -1, n_kv_heads, heads_per_group, self.head_dim)
+            # Logits: [b, t, n_kv, g, h] * [b, s, n_kv, h] -> [b, n_kv, g, t, s]
+            logits = torch.einsum("btngh, bsnh -> bngts", q_gqa, k.to(x.dtype)) * scale
+            # Flatten heads: [b, n_heads, t, s]
+            logits = logits.reshape(batch_size, n_heads, -1, k.shape[1])
         else:
-            # [batch, n_heads, q_seq, k_seq]
+            # Standard Multi-Head or Multi-Query: [b, t, n, h] * [b, s, n, h] -> [b, n, t, s]
             logits = torch.einsum("btnh, bsnh -> bnts", q, k.to(x.dtype)) * scale
         
         if self.attn_logits_softcap is not None:
             logits = torch.tanh(logits / self.attn_logits_softcap) * self.attn_logits_softcap
             
         logits = logits + attn_mask
-        probs = F.softmax(logits, dim=-1).to(x.dtype)
+        probs = F.softmax(logits.float(), dim=-1).to(x.dtype)
         
-        # Mix values using broadcasting
+        # Mix values using GQA-aware einsum
         if heads_per_group > 1:
-            # probs: [batch, n_heads, q_seq, k_seq] -> [batch, n_kv_heads, heads_per_group, q_seq, k_seq]
-            probs_reshaped = probs.view(batch_size, n_kv_heads, heads_per_group, q_seq_len, k_seq_len)
-            # v: [batch, k_seq, n_kv_heads, head_dim] -> [batch, n_kv_heads, k_seq, head_dim]
-            v_reshaped = v.to(x.dtype).transpose(1, 2)
-            # [batch, n_kv_heads, 1, k_seq, head_dim]
-            v_reshaped = v_reshaped.unsqueeze(2)
-            
-            # [batch, n_kv_heads, heads_per_group, q_seq, head_dim]
-            encoded = torch.matmul(probs_reshaped, v_reshaped)
-            # [batch, q_seq, n_heads, head_dim]
-            encoded = encoded.reshape(batch_size, n_heads, q_seq_len, self.head_dim).transpose(1, 2)
+            # Reshape probs back to groups: [b, n_kv, g, t, s]
+            probs_gqa = probs.view(batch_size, n_kv_heads, heads_per_group, -1, k.shape[1])
+            # Mix: [b, n_kv, g, t, s] * [b, s, n_kv, h] -> [b, t, n_kv, g, h]
+            encoded = torch.einsum("bngts, bsnh -> btngh", probs_gqa, v.to(x.dtype))
+            # Flatten heads: [b, t, n_heads, h]
+            encoded = encoded.reshape(batch_size, -1, n_heads, self.head_dim)
         else:
-            # [batch, q_seq, n_heads, head_dim]
+            # Standard mix: [b, n, t, s] * [b, s, n, h] -> [b, t, n, h]
             encoded = torch.einsum("bnts, bsnh -> btnh", probs, v.to(x.dtype))
         
         # Output projection
@@ -258,6 +266,7 @@ def create_layer_cache(
         ),
         'end_index': torch.zeros((batch_size,), dtype=torch.int32, device=device),
         'positions': torch.zeros((batch_size, cache_size), dtype=torch.int32, device=device),
+        'modalities': torch.zeros((batch_size, cache_size), dtype=torch.int32, device=device),
     }
 
 class HadamardAttention(nn.Module):
@@ -303,16 +312,32 @@ class Embedder(nn.Module):
         self.input_embedding_table = nn.Parameter(
             torch.empty(self.vocab_size, self.hidden_size)
         )
-        nn.init.normal_(self.input_embedding_table, std=config.text.initializer_range)
+        nn.init.normal_(
+                        self.input_embedding_table,
+                        std=config.text.initializer_range
+                    )
 
         # soft embeddings 
-        if config.audio:
-            self.mm_input_projection = Einsum(
-                weight_shape=(config.audio.input_feat_size, config.audio.hidden_size),
-                pattern="eh", # e=input_feat_size, h=hidden
+        if config.vision:
+            self.vision_input_projection = Einsum(
+                weight_shape=(
+                    config.vision.hidden_size, # 2048 for MobileNetV5
+                    self.hidden_size
+                ),
+                pattern="eh",
             )
+        if config.audio:
+            self.audio_input_projection = Einsum(
+                weight_shape=(
+                    config.audio.hidden_size, # 512
+                    self.hidden_size
+                ),
+                pattern="eh",
+            )
+        
+        if config.vision or config.audio:
             self.mm_soft_embedding_norm = MatryoshkaNorm(
-                weight_shape=(config.audio.hidden_size,),
+                weight_shape=(self.hidden_size,),
                 pattern="h",
             )
 
@@ -342,42 +367,50 @@ class Embedder(nn.Module):
         self, 
         input_ids: torch.Tensor, 
         d_model: int,
-        soft_tokens: torch.Tensor | None = None,
-        soft_token_mask: torch.Tensor | None = None,
+        vision_tokens: torch.Tensor | None = None,
+        audio_tokens: torch.Tensor | None = None,
+        modality_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Args:
-            input_ids: [batch, seq] token IDs
-            d_model: Current Matryoshka width
-            soft_tokens: [batch, seq, feat_size] 
-            soft_token_mask: [batch, seq] true = use soft_tokens
-            
-        Returns:
-            x: [batch, seq, d_model] initial residual stream
-            per_layer_inputs: [batch, seq, num_layers, latent_dim] AltUp side-inputs
-        """
-        x = F.embedding(input_ids, self.input_embedding_table)
-        
-        if soft_tokens is not None and soft_token_mask is not None:
-            # [b, s, e] -> [b, s, h]
-            soft_x = self.mm_input_projection("bse, eh -> bsh", soft_tokens, h=self.hidden_size)
-            soft_x = self.mm_soft_embedding_norm(soft_x, h=self.hidden_size)
-            
-            # soft_token_mask: [batch, seq, 1] for broadcasting
-            mask = soft_token_mask.unsqueeze(-1)
-            x = torch.where(mask, soft_x, x)
-
-        x = x[:, :, :d_model]
+        # ...
+        # Avoid negative indices for placeholders
+        safe_input_ids = torch.clamp(input_ids, min=0)
+        x = F.embedding(safe_input_ids, self.input_embedding_table)
         
         # scale by sqrt(max_hidden_size))
         x = x * (self.hidden_size ** 0.5)
 
+        if modality_mask is not None:
+            # Handle Vision (Modality 1)
+            if vision_tokens is not None and hasattr(self, 'vision_input_projection'):
+                v_x = self.vision_input_projection("bte, eh -> bth", vision_tokens, h=self.hidden_size)
+                v_x = self.mm_soft_embedding_norm(v_x, h=self.hidden_size)
+                
+                # Scatter into x at modality_mask == 1
+                v_mask = (modality_mask == 1)
+                # Ensure x and v_x have same hidden dim for this part
+                x[v_mask] = v_x.view(-1, self.hidden_size).to(x.dtype)
+
+            # Handle Audio (Modality 2)
+            if audio_tokens is not None and hasattr(self, 'audio_input_projection'):
+                a_x = self.audio_input_projection("bte, eh -> bth", audio_tokens, h=self.hidden_size)
+                a_x = self.mm_soft_embedding_norm(a_x, h=self.hidden_size)
+                a_mask = (modality_mask == 2)
+                x[a_mask] = a_x.view(-1, self.hidden_size).to(x.dtype)
+
+        x = x[:, :, :d_model]
+        
         per_layer_inputs = None
         if hasattr(self, 'per_layer_embedding_table'):
             # [batch, seq, num_layers, latent_dim]
             # F.embedding doesn't support 3D weights, use direct indexing
             # input_ids: [b, s], table: [v, l, d] -> [b, s, l, d]
-            per_layer_inputs = self.per_layer_embedding_table[input_ids]
+            per_layer_inputs = self.per_layer_embedding_table[safe_input_ids]
+            
+            # Mask out non-text positions if modality_mask is provided
+            if modality_mask is not None:
+                # modality_mask: [b, s], 0 is text
+                text_mask = (modality_mask == 0)
+                per_layer_inputs = per_layer_inputs * text_mask.unsqueeze(-1).unsqueeze(-1).to(per_layer_inputs.dtype)
             
         return x, per_layer_inputs
 
@@ -386,3 +419,83 @@ class Embedder(nn.Module):
         # latent: [batch, seq, latent_dim]
         x = self.per_layer_projection("bsl, lh -> bsh", latent, h=d_model)
         return self.per_layer_projection_norm(x, h=d_model)
+
+    def encode_vision(self, x: torch.Tensor) -> torch.Tensor:
+        """Projects siglip embeddings to the embedding space of the text encoder."""
+        x = self.mm_soft_embedding_norm(x)
+        x = self.mm_input_projection('...tm,md->...td', x)
+        return x
+
+
+class AdaptiveSurprisal(nn.Module):
+    """
+    Monitors prediction confidence (surprisal) and suggests a Matryoshka width.
+    High surprisal (high entropy) -> Increase d_model
+    Low surprisal (low entropy) -> Decrease d_model
+    """
+    def __init__(self, config: Gemma3nConfig):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.text.hidden_size
+        self.vocab_size = config.text.vocab_size
+        
+        # Mini-norm for the surprisal head
+        self.norm = MatryoshkaNorm(
+            weight_shape=(self.hidden_size,),
+            pattern="h",
+        )
+        
+        # The head itself is just an Einsum, but we'll tie its weight to the main table
+        # We don't initialize its own weight here; it will be tied in the Transformer.
+        self.head = Einsum(
+            weight_shape=(self.vocab_size, self.hidden_size),
+            pattern="vh",
+        )
+
+    def forward(self, 
+                h: torch.Tensor, 
+                d_model: int,
+                max_width: int,
+                min_width: int = 128,
+                confidence_threshold: float = 0.8, # If top token < 80% prob, increase width
+        ) -> int:
+        """
+        Args:
+            h: [batch, seq, d_model] current hidden state
+            d_model: current width
+            max_width: maximum allowed width
+            min_width: minimum allowed width
+            confidence_threshold: prob threshold to trigger width increase
+            
+        Returns:
+            suggested_d_model: power of two width
+        """
+        # 1. Use a very small slice for the surprisal check (e.g. min_width)
+        # to keep the check itself fast.
+        check_dim = min(d_model, min_width)
+        
+        # 2. Project to vocab space (only for the last token in sequence for efficiency)
+        # h_last: [batch, 1, check_dim]
+        h_last = h[:, -1:, :check_dim]
+        h_last = self.norm(h_last, h=check_dim)
+        
+        # logits: [batch, 1, vocab]
+        logits = self.head("bsh, vh -> bsv", h_last, h=check_dim)
+        
+        # 3. Use Top-K to filter noise and find max confidence
+        # k=512 captures the viable candidates in a large vocab
+        top_logits, _ = torch.topk(logits.float(), k=512, dim=-1)
+        probs = F.softmax(top_logits, dim=-1)
+        
+        # max_prob: average confidence of the top prediction across the batch
+        max_prob = probs[:, :, 0].mean()
+        
+        # 4. Logic: Move d_model up or down based on confidence
+        if max_prob < confidence_threshold:
+            # Low confidence -> Increase width to think harder
+            return min(d_model * 2, max_width)
+        elif max_prob > 0.98:
+            # Extremely high confidence -> Decrease width to save compute
+            return max(d_model // 2, min_width)
+        
+        return d_model

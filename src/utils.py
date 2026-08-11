@@ -1,6 +1,5 @@
 from contextlib import contextmanager
 import torch
-import treescope
 from blocks import Gemma3nTransformer
 
 @contextmanager
@@ -69,5 +68,3 @@ def capture_activations(model: Gemma3nTransformer,
         for h in hooks:
             h.remove()        
 
-# TODO: decorate the Einsum class to "natively" visualize
-#       with treescope ? 

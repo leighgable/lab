@@ -70,11 +70,11 @@ def precompute_rope_cache(max_seq_len: int, d_head: int, base: float):
     Returns:
         cos, sin: Tensors of shape [max_seq_len, d_head]
     """
-    # 1. Calculate the frequencies (theta)
+    # 1. Calculate the frequencies (theta) in float32
     indices = torch.arange(0, d_head, 2).float()
     inv_freq = 1.0 / (base ** (indices / d_head))
     
-    # 2. Calculate the positions (t)
+    # 2. Calculate the positions (t) in float32
     t = torch.arange(max_seq_len).float()
     
     # 3. Outer product [Seq, d_head // 2]
@@ -82,7 +82,7 @@ def precompute_rope_cache(max_seq_len: int, d_head: int, base: float):
     
     # 4. Create [Seq, d_head] by repeating (standard RoPE layout)
     emb = torch.cat((freqs, freqs), dim=-1)
-    return emb.cos(), emb.sin()
+    return emb.cos().float(), emb.sin().float()
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -100,14 +100,6 @@ def apply_rotary_pos_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
 class PerLayerEmbedding(nn.Module):
     def __init__(self, config: TextConfig):
         super().__init__()
-        # PLE bank stores token-specific latents in the bottleneck dimension
-        self.ple_bank = nn.ModuleDict({
-            str(i): nn.Embedding(
-                config.vocab_size,
-                config.head_dim,  # Latent dimension (256)
-            ) for i in range(config.num_hidden_layers)
-        })
-
         # down [Hidden, Latent] -> pattern "hl"
         self.down_proj = Einsum(
             weight_shape=(config.hidden_size, config.head_dim),
@@ -218,8 +210,8 @@ class MatryoshkaFFN(nn.Module):
         if self.activation_sparsity > 0.0:
             gate = self._gaussian_topk(gate)
         
-        # GLU logic as per Jax impl.
-        junction = gate * F.gelu(up)
+        # GLU logic: GELU(gate) * up
+        junction = F.gelu(gate, approximate='tanh') * up
 
         # down projection: [b, s, d_ff] -> [b, s, d_model]
         return self.down_proj('bsi, ih -> bsh', junction, i=d_ff, h=d_model)
@@ -248,7 +240,7 @@ class MatryoshkaNorm(nn.Module):
         if with_scale:
             self.weight = nn.Parameter(torch.ones(weight_shape))
 
-    def forward(self, x: torch.Tensor, **slices):
+    def forward(self, x: torch.Tensor, offset: int = 0, **slices):
         # standard RMSNorm on the last dimension
         # x shape: [..., d_curr]
         # calculate in float32 for numerical stability
@@ -261,10 +253,12 @@ class MatryoshkaNorm(nn.Module):
             slicer = []
             if self.pattern:
                 for char in self.pattern:
-                    slicer.append(slice(0, slices.get(char)))
+                    start = offset if char == self.pattern[0] else 0
+                    end = start + slices.get(char) if char in slices else None
+                    slicer.append(slice(start, end))
             else:
                 # simple slicing 
-                slicer.append(slice(0, x.shape[-1]))
+                slicer.append(slice(offset, offset + x.shape[-1]))
             
             # slice and cast
             w = self.weight[tuple(slicer)].float()
@@ -316,7 +310,7 @@ class AlternatingUpdates(nn.Module):
     def compute_router_modalities(self, x_active: torch.Tensor, d_model: int) -> torch.Tensor:
         """Maps residual stream to a small modality space."""
         # x_active: [batch, seq, d_model]
-        normed = self.router_norm(x_active, h=d_model) * self.router_input_scale
+        normed = self.router_norm(x_active, h=d_model)
         # (batch, seq, d_model) @ (d_model, num_inputs) -> (batch, seq, num_inputs)
         routed = self.modality_router("bsh, hi -> bsi", normed, h=d_model)
         return torch.tanh(routed.float()).to(x_active.dtype)
@@ -331,7 +325,7 @@ class AlternatingUpdates(nn.Module):
         
         # compute transition coefficients: [batch, seq, num_inputs, num_inputs]
         # (batch, seq, i) @ (i, j, k) -> (batch, seq, j, k)
-        all_coefs = self.prediction_proj("bsi, ijk -> bsjk", modalities)
+        all_coefs = self.prediction_proj("bsi, ijk -> bsjk", modalities) / 100.0
         
         if self.config.altup_coef_clip is not None:
              all_coefs = all_coefs.clamp(-self.config.altup_coef_clip, self.config.altup_coef_clip)
@@ -340,7 +334,7 @@ class AlternatingUpdates(nn.Module):
         # (batch, seq, j, k) @ (k, batch, seq, d_model) -> (batch, seq, j, d_model)
         predictions = torch.einsum("bsjk, kbsd -> jbsd", all_coefs, x)
         
-        return predictions + x
+        return predictions
 
     def correct(self, predictions: torch.Tensor, activated: torch.Tensor, d_model: int) -> torch.Tensor:
         """
@@ -354,7 +348,7 @@ class AlternatingUpdates(nn.Module):
         innovation = activated - predictions[self.config.altup_active_idx]
         
         # correction coefficients: [batch, seq, num_inputs]
-        all_coefs = self.correction_proj("bsi, ij -> bsj", modalities) + 1.0
+        all_coefs = (self.correction_proj("bsi, ij -> bsj", modalities) / 100.0) + 1.0
         
         if self.config.altup_coef_clip is not None:
             all_coefs = all_coefs.clamp(1.0 - self.config.altup_coef_clip, 1.0 + self.config.altup_coef_clip)
